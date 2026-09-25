@@ -1,0 +1,187 @@
+# Agent Security Configuration Template
+# Complete guardrails configuration for an agentic system instance.
+#
+# Usage: Copy this file, customise values for your agent, and deploy to your
+#        orchestration platform. Review with your security team before production
+#        use. Every field maps to a control described in the handbook; the
+#        relevant chapter is noted in the inline comments.
+#
+# Version: 2.0 - 2026
+# Author: Mervin Pearce, Pearce.Academy
+# License: CC-BY-4.0
+
+# ---------------------------------------------------------------------------
+# Agent identity and classification (see handbook/03-governance-framework.md)
+# ---------------------------------------------------------------------------
+agent:
+  id: trade_execution_agent_v3          # Unique identifier for this agent instance
+  version: "3.2.1"                      # Semantic version; increment on each change
+  owner: trading-platform-team          # Team accountable for this agent
+  classification: Class D               # A/B/C/D per impact x autonomy matrix
+
+  architecture:
+    pattern: Plan-and-Execute           # ReAct | Plan-and-Execute | Multi-Agent | Hierarchical
+    max_planning_steps: 10              # Maximum reasoning steps before timeout
+    max_tool_calls_per_step: 3          # Concurrent tool calls allowed per step
+    timeout_seconds: 120               # Total execution timeout
+
+  # EU AI Act positioning (see handbook/11-regulatory-alignment.md)
+  regulatory:
+    eu_ai_act_risk: high               # high | limited | minimal
+    role: deployer                     # provider | deployer (changes on fine-tune)
+    dora_in_scope: true                # ICT risk register entry required
+    human_oversight_article_14: true   # Meaningful oversight designed in
+
+# ---------------------------------------------------------------------------
+# Non-human identity (see handbook/05-identity-and-secrets.md)
+# ---------------------------------------------------------------------------
+identity:
+  workload_identity: spiffe://example.com/ns/trading/sa/trade-execution-agent
+  credential_type: short_lived         # short_lived | long_lived (avoid)
+  credential_ttl_seconds: 900          # 15 minutes; task-scoped, auto-rotated
+  issuer: spire                        # spire | vault | cloud_iam
+  jml_owner: identity-governance-team  # Joiner-Mover-Leaver accountability
+  secret_rotation_days: 1              # Rotation SLA for any static secret
+
+# ---------------------------------------------------------------------------
+# Tool permissions (see handbook/04-security-controls.md)
+# ---------------------------------------------------------------------------
+permissions:
+  default: deny                        # Deny by default; grant explicitly below
+  tools:
+    - name: query_market_data
+      type: read-only                  # read-only | write-specific | execute-limited
+      scope: public_markets            # Which data sources this tool can access
+
+    - name: execute_trade
+      type: write-specific
+      scope: "symbols in [AAPL, MSFT, GOOGL]; max_quantity: 1000"
+
+    - name: update_portfolio
+      type: execute-limited
+      scope: "rebalance only; no new positions"
+
+    - name: send_notification
+      type: write-specific
+      scope: "to: internal_team"
+
+  approval_gates:
+    execute_trade: Gate 2              # Human approval for trades >$10,000
+    update_portfolio: Gate 1          # Light oversight for portfolio changes
+    large_transfer: Gate 3            # Dual approval for transfers >$1m
+
+# ---------------------------------------------------------------------------
+# Memory and data controls (see handbook/02 and 04)
+# ---------------------------------------------------------------------------
+memory:
+  storage_type: vector_database        # vector_database | structured_sql | file_system
+  retention_days: 90                   # Days before automatic purge of stale entries
+  encryption_at_rest: true             # Encrypt stored memory at rest
+  write_permission_check: true         # Verify permissions before each memory write
+  provenance_tracking: true            # Tag each entry with source and trust level
+  classification:
+    - level: public                    # No restrictions
+      fields: [agent_id, timestamp, action_type]
+    - level: confidential              # Internal use only; encrypted
+      fields: [portfolio_data, trade_details]
+    - level: pii                       # Personal data; GDPR applies
+      fields: [customer_id, account_number]
+
+# ---------------------------------------------------------------------------
+# Runtime guardrails (see handbook/04-security-controls.md)
+# ---------------------------------------------------------------------------
+guardrails:
+  input:
+    max_tokens: 8192                   # Maximum context window size
+    injection_detection: enabled       # Detect prompt injection in input
+    injection_block_severity: HIGH     # Block at HIGH or CRITICAL findings
+    schema_validation: strict          # Validate input against expected schema
+    scan_retrieved_content: true       # Treat RAG/tool output as untrusted (indirect injection)
+
+  tools:
+    max_concurrent_calls: 3            # Limit parallel tool execution
+    timeout_per_call_seconds: 30       # Per-tool call timeout
+    deny_list: ["rm -rf", "drop table", "curl", "wget"]  # Always blocked
+    require_approval_for:              # Tools that need human approval before use
+      - execute_trade
+      - update_account_status
+
+  output:
+    mask_pii: true                     # Automatically mask PII in outputs
+    max_data_volume_mb: 50             # Maximum data volume per response
+    egress_filtering: enabled          # Restrict outbound data transfers
+    allowed_egress_domains:            # Approved destinations only
+      - api.internal.example
+      - reports.internal.example
+    validate_output_handling: true     # Escape/encode before downstream use (LLM05)
+
+  memory:
+    retention_days: 90                 # Override agent-level retention if needed
+    encryption_at_rest: true           # Override agent-level encryption setting
+    write_permission_check: true       # Verify permissions before each memory write
+    audit_all_writes: true             # Log every memory modification
+
+# ---------------------------------------------------------------------------
+# MCP and protocol controls (see handbook/08-mcp-and-protocols.md)
+# ---------------------------------------------------------------------------
+mcp:
+  enabled: true
+  allowed_servers:                     # Pin trusted MCP servers only
+    - name: market-data-mcp
+      url: "https://mcp.internal.example/market"
+      auth: mtls                       # Never allow unauthenticated servers
+      tool_definition_pinning: true    # Detect rug-pull changes to tool metadata
+  reject_unauthenticated: true         # Block servers responding without auth
+  scan_tool_descriptions: true         # Detect tool-poisoning in metadata
+  sampling:
+    allow_server_initiated: false      # Block server-initiated sampling by default
+  stdio_transport:
+    sanitise_config_parameters: true   # Mitigate OX Security STDIO flaw (2026)
+
+# ---------------------------------------------------------------------------
+# Circuit breaker (see handbook/04 and code/python/circuit_breaker.py)
+# ---------------------------------------------------------------------------
+circuit_breaker:
+  failure_threshold: 5                 # Number of failures before tripping
+  window_seconds: 60                   # Time window for counting failures
+  cooldown_seconds: 300                # OPEN duration before trial calls
+  half_open_max_calls: 1               # Trial calls allowed in HALF_OPEN
+  auto_reset_after_minutes: 30         # Automatic reset after cooldown (0 = manual only)
+  actions_on_trip:                     # What happens when circuit breaker trips
+    - pause_tool_calls                 # Stop all tool execution
+    - log_event                        # Record trip event with context
+    - send_alert                       # Notify on-call team
+
+# ---------------------------------------------------------------------------
+# Monitoring (see handbook/10 and code/configs/monitoring_config.yaml)
+# ---------------------------------------------------------------------------
+monitoring:
+  decision_trace: enabled              # Log full reasoning trace for every action
+  metrics_dashboard: true              # Real-time metrics dashboard
+  alert_channels: [slack, email, pagerduty]  # Notification destinations
+  cost_ceiling_usd_per_hour: 500       # Denial-of-wallet guard (LLM10)
+
+  anomaly_detection:
+    tool_call_rate_threshold: "20_per_minute"     # Alert if exceeded
+    data_volume_threshold_mb: 200                 # Alert on unusual data reads
+    unique_tools_threshold: 15                    # Alert on unexpected tool diversity
+
+# ---------------------------------------------------------------------------
+# Audit (see handbook/11 and code/python/audit_logger.py)
+# ---------------------------------------------------------------------------
+audit:
+  log_all_actions: true                # Record every agent action
+  log_memory_writes: true              # Record every memory modification
+  log_egress_events: true              # Record every data transfer out of the system
+  hash_chain: true                     # Tamper-evident hash-chained records
+  retention_days: 365                  # Minimum 1 year for regulatory compliance
+
+# ---------------------------------------------------------------------------
+# Kill switch (see handbook/10 and handbook/12)
+# ---------------------------------------------------------------------------
+kill_switch:
+  agent_level: enabled                 # Stop individual agent instance
+  category_level: enabled              # Stop all agents of this type
+  system_level: enabled                # Revert entire agentic system to manual mode
+  independent_access: true             # Accessible from outside the agent system
+  requires_manual_reset: true          # No automatic restart after trip

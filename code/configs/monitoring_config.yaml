@@ -1,0 +1,245 @@
+# Agent Observability & Monitoring Configuration
+# OpenTelemetry-compatible monitoring configuration for autonomous AI agents.
+#
+# This file describes the signals, exporters, and alert rules recommended in
+# chapter 04 (Security Controls Playbook) and chapter 10 (Production Deployment).
+# It is written against OpenTelemetry semantic conventions plus the emerging
+# GenAI/agent conventions so that traces, metrics, and logs share correlation
+# identifiers. Adapt exporter endpoints and thresholds to your platform.
+#
+# Version: 2.0 - 2026
+# Author: Mervin Pearce, Pearce.Academy
+# License: CC-BY-4.0
+
+service:
+  name: agentic-ai-platform
+  namespace: financial-services
+  environment: production          # production | staging | development
+  version: "2.0.0"
+
+# ---------------------------------------------------------------------------
+# OpenTelemetry SDK configuration
+# ---------------------------------------------------------------------------
+opentelemetry:
+  resource_attributes:
+    service.name: agentic-ai-platform
+    service.namespace: financial-services
+    deployment.environment: production
+    # Custom attributes carried on every span/metric/log for agent correlation.
+    agent.platform.owner: security-engineering
+    agent.platform.data_residency: eu-west-1
+
+  # Trace pipeline: captures the full decision -> tool-call -> result path.
+  traces:
+    sampler: parentbased_traceidratio
+    sampler_arg: 1.0               # Sample 100% of agent decision traces; these
+                                   # are security-relevant, not high-volume web spans.
+    max_attributes_per_span: 128
+    exporter:
+      type: otlp
+      protocol: grpc
+      endpoint: "https://otel-collector.internal.example:4317"
+      timeout_ms: 10000
+      headers:
+        x-tenant: financial-services
+    span_attributes:              # GenAI/agent semantic-convention attributes.
+      - gen_ai.system
+      - gen_ai.request.model
+      - gen_ai.agent.id
+      - gen_ai.agent.name
+      - gen_ai.operation.name       # e.g. chat, execute_tool, plan
+      - gen_ai.usage.input_tokens
+      - gen_ai.usage.output_tokens
+      - agent.decision.step
+      - agent.decision.gate         # Gate 0-3 from the governance model
+      - agent.tool.name
+      - agent.tool.access_level
+      - agent.tool.decision         # allowed | denied | approval_pending
+      - agent.data.classification   # public | internal | confidential | pii
+
+  # Metric pipeline: numeric signals feeding dashboards and alerts.
+  metrics:
+    export_interval_ms: 15000
+    exporter:
+      type: otlp
+      protocol: grpc
+      endpoint: "https://otel-collector.internal.example:4317"
+
+  # Log pipeline: structured audit and guardrail events.
+  logs:
+    exporter:
+      type: otlp
+      protocol: grpc
+      endpoint: "https://otel-collector.internal.example:4317"
+    # Correlate logs with traces so an alert links straight to the decision path.
+    include_trace_context: true
+
+# ---------------------------------------------------------------------------
+# Metric definitions
+# ---------------------------------------------------------------------------
+metrics:
+  - name: agent.tool.calls
+    instrument: counter
+    unit: "1"
+    description: "Total tool calls, tagged by tool, decision and gate."
+    attributes: [agent.id, agent.tool.name, agent.tool.decision, agent.decision.gate]
+
+  - name: agent.tool.call.duration
+    instrument: histogram
+    unit: ms
+    description: "Latency of individual tool calls."
+    attributes: [agent.id, agent.tool.name]
+    buckets_ms: [10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000]
+
+  - name: agent.tool.failures
+    instrument: counter
+    unit: "1"
+    description: "Failed tool calls, tagged by error class."
+    attributes: [agent.id, agent.tool.name, error.type]
+
+  - name: agent.injection.detections
+    instrument: counter
+    unit: "1"
+    description: "Prompt-injection findings from the input validator."
+    attributes: [agent.id, injection.severity, injection.rule]
+
+  - name: agent.egress.bytes
+    instrument: counter
+    unit: By
+    description: "Bytes leaving the agent boundary, tagged by classification."
+    attributes: [agent.id, agent.egress.destination, agent.data.classification]
+
+  - name: agent.tokens.consumed
+    instrument: counter
+    unit: "1"
+    description: "LLM tokens consumed; underpins unbounded-consumption alerts (LLM10)."
+    attributes: [agent.id, gen_ai.request.model, token.direction]
+
+  - name: agent.cost.usd
+    instrument: counter
+    unit: "1"
+    description: "Estimated spend, for denial-of-wallet detection."
+    attributes: [agent.id, gen_ai.request.model]
+
+  - name: agent.circuit_breaker.state
+    instrument: updowncounter
+    unit: "1"
+    description: "Circuit-breaker state gauge (0 closed, 1 half_open, 2 open)."
+    attributes: [agent.id, agent.action.type]
+
+  - name: agent.approvals.pending
+    instrument: updowncounter
+    unit: "1"
+    description: "Count of actions awaiting human approval."
+    attributes: [agent.id, agent.decision.gate]
+
+# ---------------------------------------------------------------------------
+# Alert rules
+# Thresholds align with the anomaly-detection table in chapter 04.
+# ---------------------------------------------------------------------------
+alerting:
+  # Routing destinations referenced by rules below.
+  receivers:
+    - name: oncall-pager
+      type: pagerduty
+      routing_key_env: PAGERDUTY_ROUTING_KEY
+    - name: security-slack
+      type: slack
+      webhook_env: SLACK_SECURITY_WEBHOOK
+    - name: soc-email
+      type: email
+      address: soc@example.com
+
+  rules:
+    - name: HighToolCallRate
+      expr: "rate(agent.tool.calls[1m]) > 20"
+      severity: warning
+      for: 2m
+      receivers: [security-slack]
+      annotations:
+        summary: "Agent {{ $labels.agent_id }} tool-call rate above baseline."
+        runbook: "handbook/10-production-deployment.md#kill-switch-procedures"
+
+    - name: CriticalToolCallRate
+      expr: "rate(agent.tool.calls[1m]) > 50"
+      severity: critical
+      for: 1m
+      receivers: [oncall-pager, security-slack]
+      annotations:
+        summary: "Agent {{ $labels.agent_id }} tool-call rate at critical level."
+
+    - name: InjectionSeverityHigh
+      expr: "increase(agent.injection.detections{injection.severity='HIGH'}[5m]) > 0"
+      severity: warning
+      for: 0m
+      receivers: [security-slack]
+
+    - name: InjectionSeverityCritical
+      expr: "increase(agent.injection.detections{injection.severity='CRITICAL'}[5m]) > 0"
+      severity: critical
+      for: 0m
+      receivers: [oncall-pager, security-slack]
+
+    - name: UnusualEgressVolume
+      expr: "increase(agent.egress.bytes{agent.data.classification=~'confidential|pii'}[5m]) > 209715200"
+      severity: critical
+      for: 0m
+      receivers: [oncall-pager, security-slack]
+      annotations:
+        summary: "Confidential/PII egress exceeded 200 MB in 5 minutes."
+
+    - name: ToolFailureRatioHigh
+      expr: "rate(agent.tool.failures[5m]) / rate(agent.tool.calls[5m]) > 0.15"
+      severity: warning
+      for: 5m
+      receivers: [security-slack]
+
+    - name: CircuitBreakerOpen
+      expr: "agent.circuit_breaker.state == 2"
+      severity: critical
+      for: 0m
+      receivers: [oncall-pager]
+      annotations:
+        summary: "Circuit breaker OPEN for {{ $labels.agent_id }}/{{ $labels.action_type }}."
+
+    - name: DenialOfWalletSpend
+      expr: "increase(agent.cost.usd[1h]) > 500"
+      severity: critical
+      for: 0m
+      receivers: [oncall-pager, soc-email]
+      annotations:
+        summary: "Estimated hourly spend above USD 500 (possible LLM10 abuse)."
+
+    - name: ApprovalBacklog
+      expr: "agent.approvals.pending > 25"
+      severity: warning
+      for: 10m
+      receivers: [security-slack]
+
+# ---------------------------------------------------------------------------
+# Dashboards (panel definitions consumed by your visualisation layer)
+# ---------------------------------------------------------------------------
+dashboards:
+  - name: Agent Security Overview
+    panels:
+      - title: Tool calls by decision
+        metric: agent.tool.calls
+        group_by: [agent.tool.decision]
+      - title: Injection detections by severity
+        metric: agent.injection.detections
+        group_by: [injection.severity]
+      - title: Confidential/PII egress (bytes)
+        metric: agent.egress.bytes
+        filter: "agent.data.classification in (confidential, pii)"
+      - title: Estimated spend (USD)
+        metric: agent.cost.usd
+      - title: Circuit-breaker states
+        metric: agent.circuit_breaker.state
+
+# ---------------------------------------------------------------------------
+# Retention (aligns with the 365-day audit retention in the config template)
+# ---------------------------------------------------------------------------
+retention:
+  traces_days: 90
+  metrics_days: 400
+  logs_days: 365                   # >= 1 year for regulatory record-keeping
