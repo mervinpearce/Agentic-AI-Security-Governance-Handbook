@@ -57,7 +57,7 @@ flowchart TD
     Client -->|3. call tool with args| Server
     Server -->|4. result| Client
     Server --> Backend[(Backend resource: DB, API, files)]
-    Client -.5. optional sampling request.-> Host
+    Client -.-> Host
 ```
 
 The exchange has four points an attacker cares about. Step 2, where the server sends tool definitions, is where **tool poisoning** and **shadowing** land, because the descriptions enter the agent's context. Step 3, the call, is where an over-permissioned tool does damage. The connection itself is where an **unauthenticated server** lets anyone in. And step 5, optional server-initiated sampling, is an extra injection channel.
