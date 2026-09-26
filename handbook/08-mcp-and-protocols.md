@@ -282,7 +282,7 @@ sequenceDiagram
     B->>R: Act within scoped grant only
     R-->>B: Result
     B-->>A: Return result - grant expires
-    Note over A,R: No full-token inheritance; grant cannot be replayed
+    Note over A,R: No full-token inheritance - grant cannot be replayed
 ```
 
 **Controls for A2A and delegation:**
