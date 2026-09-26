@@ -281,7 +281,7 @@ sequenceDiagram
     B->>B: Verify Agent Card signature
     B->>R: Act within scoped grant only
     R-->>B: Result
-    B-->>A: Return result; grant expires
+    B-->>A: Return result - grant expires
     Note over A,R: No full-token inheritance; grant cannot be replayed
 ```
 
