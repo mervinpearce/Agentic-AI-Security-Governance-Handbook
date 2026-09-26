@@ -59,7 +59,7 @@ sequenceDiagram
     V-->>A: Task-scoped token (TTL minutes)
     A->>R: Call with task token
     R-->>A: Result
-    Note over A,R: Token expires; nothing reusable persists
+    Note over A,R: Token expires - nothing reusable persists
 ```
 
 **Design rules for task-scoped credentials:**
